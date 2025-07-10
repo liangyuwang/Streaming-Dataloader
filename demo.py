@@ -152,7 +152,7 @@ def main_ddp():
     # Create DataLoader with distributed sampler
     dataloader = DataLoader(
         dataset,
-        batch_size=args.batch_size,
+        batch_size=args.batch_size // world_size,  # batch_size per GPU
         shuffle=False,  # Must be False when using DistributedSampler
         sampler=sampler,
         num_workers=args.num_workers,
