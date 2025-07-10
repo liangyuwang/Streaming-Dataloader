@@ -11,7 +11,7 @@ from datasets import load_from_disk
 
 class SlidingTokenDataset(Dataset):
     def __init__(self, dataset_path=None, split="train", split_rate=1.0,
-                 seq_len=1024, stride=512, batch_size=1, m=None, 
+                 seq_len=1024, stride=512, batch_size=1, m=1, 
                  seed=42, rank=0, world_size=1, 
                  cache_capacity=2, tokens_per_chunk=1e8):
         all_shard_paths = sorted([
@@ -32,7 +32,7 @@ class SlidingTokenDataset(Dataset):
         self.seq_len = seq_len
         self.stride = stride
         self.batch_size = batch_size
-        self.m = m
+        self.m = m  # normally be 1 for next token prediction
         self.seed = seed
         self.rank = rank
         self.world_size = world_size
