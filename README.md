@@ -27,10 +27,20 @@ Streaming-Dataloader is a high-performance data loading solution that enables tr
 ```bash
 git clone https://github.com/your-username/Streaming-Dataloader.git
 cd Streaming-Dataloader
-
-# Install dependencies
-pip install torch datasets transformers tqdm numpy
 ```
+
+### Dependencies
+
+This project requires the following packages with tested versions:
+
+- **PyTorch**: 2.4.0
+- **CUDA**: 12.1
+- **datasets**: 3.5.1
+- **transformers**: 4.51.3
+- **tqdm**: 4.66.5
+- **numpy**: 1.26.4
+
+Please install these dependencies according to your environment setup.
 
 ## 🔧 Data Preparation
 
