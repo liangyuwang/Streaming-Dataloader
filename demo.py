@@ -17,10 +17,10 @@ def get_args():
                        help="Path to the preprocessed dataset directory")
     parser.add_argument("--seq_len", type=int, default=1024,
                        help="Sequence length for each sample")
-    parser.add_argument("--stride", type=int, default=512,
+    parser.add_argument("--stride", type=int, default=1024,
                        help="Sliding window stride (how much to move window each step)")
     parser.add_argument("--batch_size", type=int, default=16,
-                       help="Batch size for training")
+                       help="Batch size per device for training")
     parser.add_argument("--num_workers", type=int, default=0,
                        help="Number of DataLoader workers for parallel data loading")
     args = parser.parse_args()
@@ -56,12 +56,14 @@ def cleanup_distributed():
 
 def is_ddp_mode():
     """
-    Check if we're running in distributed data parallel mode.
+    Check if we're running in distributed data parallel mode by examining environment variables.
+    
+    When using torchrun, these environment variables are automatically set.
     
     Returns:
-        bool: True if distributed training is active, False otherwise
+        bool: True if distributed training environment is detected, False otherwise
     """
-    return dist.is_available() and dist.is_initialized()
+    return "WORLD_SIZE" in os.environ and "RANK" in os.environ
 
 def main():
     """
@@ -81,7 +83,7 @@ def main():
     dataset = SlidingTokenDataset(
         dataset_path=args.data_path, 
         split="train", 
-        split_rate=1.0,  # Use all data for training in this demo
+        split_rate=1.0,  # Use all data for training in this demo, you can set it to 0.9 for train / validation
         batch_size=args.batch_size
     )
     
@@ -136,7 +138,7 @@ def main_ddp():
         dataset_path=args.data_path,
         seq_len=args.seq_len,
         stride=args.stride,
-        batch_size=args.batch_size,
+        batch_size=int(args.batch_size*world_size), # global batch size
         rank=rank,        # Current process rank
         world_size=world_size  # Total number of processes
     )
@@ -161,10 +163,6 @@ def main_ddp():
 
     # Training loop
     for epoch in range(10):
-        # Print epoch info only on the main process to avoid cluttered output
-        if rank == 0:
-            print("Epoch: ", epoch)
-            
         # Set epoch for both dataset and sampler
         # Dataset: for shift randomization
         # Sampler: for distributed data shuffling

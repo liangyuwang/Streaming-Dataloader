@@ -36,7 +36,7 @@ class SlidingTokenDataset(Dataset):
         tokens_per_chunk (float): Expected number of tokens per chunk (for length estimation)
     """
     def __init__(self, dataset_path=None, split="train", split_rate=1.0,
-                 seq_len=1024, stride=512, batch_size=1, m=1, 
+                 seq_len=1024, stride=1024, batch_size=1, m=1, 
                  seed=42, rank=0, world_size=1, 
                  cache_capacity=2, tokens_per_chunk=1e8):
         
