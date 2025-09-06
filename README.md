@@ -49,6 +49,9 @@ First, prepare your dataset by tokenizing and chunking:
 ```bash
 cd prepare/
 
+# Optional: For users who cannot use HF, use HF-mirror
+export HF_ENDPOINT="https://hf-mirror.com"
+
 # Prepare FineWeb-Edu dataset (example)
 python fineweb_edu.py \
     --tokenizer gpt2 \
