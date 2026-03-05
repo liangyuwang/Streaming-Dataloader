@@ -107,33 +107,35 @@ def build_binary_chunks_and_save(args, dataset, tokenizer, eos_token_id,
             pos += 1
         write_tokens_to_bin(flat)
 
-    text_buffer = []
-    
-    # Optimization 2: Accumulate a text batch, then send it to the tokenizer at once to leverage internal multithreading
-    for i, example in enumerate(tqdm(dataset, desc="Tokenizing to Binary")):
-        if max_samples is not None and i >= max_samples:
-            break
-            
-        if args.text_field not in example:
-            raise KeyError(
-                f"Example missing field '{args.text_field}'. Available keys: {list(example.keys())}"
-            )
-        text_buffer.append(example[args.text_field])
+    try:
+        text_buffer = []
         
-        # Run batched processing when we have collected batch_size samples
-        if len(text_buffer) >= batch_size:
+        # Optimization 2: Accumulate a text batch, then send it to the tokenizer at once to leverage internal multithreading
+        for i, example in enumerate(tqdm(dataset, desc="Tokenizing to Binary")):
+            if max_samples is not None and i >= max_samples:
+                break
+                
+            if args.text_field not in example:
+                raise KeyError(
+                    f"Example missing field '{args.text_field}'. Available keys: {list(example.keys())}"
+                )
+            text_buffer.append(example[args.text_field])
+            
+            # Run batched processing when we have collected batch_size samples
+            if len(text_buffer) >= batch_size:
+                encoded_batch = tokenizer(text_buffer, add_special_tokens=False, return_attention_mask=False, return_token_type_ids=False)["input_ids"]
+                _flush_encoded_batch(encoded_batch)
+                text_buffer = [] # Clear buffer
+
+        # After the loop, process any remaining texts that do not make a full batch
+        if text_buffer:
             encoded_batch = tokenizer(text_buffer, add_special_tokens=False, return_attention_mask=False, return_token_type_ids=False)["input_ids"]
             _flush_encoded_batch(encoded_batch)
-            text_buffer = [] # Clear buffer
 
-    # After the loop, process any remaining texts that do not make a full batch
-    if text_buffer:
-        encoded_batch = tokenizer(text_buffer, add_special_tokens=False, return_attention_mask=False, return_token_type_ids=False)["input_ids"]
-        _flush_encoded_batch(encoded_batch)
-
-    # Close the last file handle
-    if not f.closed:
-        f.close()
+    finally:
+        # Close the last file handle
+        if not f.closed:
+            f.close()
     
     # Decide whether last chunk file is empty by checking file size (robust against state mismatches)
     last_path = os.path.join(output_dir, f"chunk_{chunk_id:06d}.bin")
