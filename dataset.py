@@ -67,6 +67,15 @@ class DistributedDataset(IterableDataset):
         rng = np.random.default_rng(base_seed)
 
         chunk_list = rng.permutation(self.chunk_files).tolist() if self.shuffle else list(self.chunk_files)
+        if len(chunk_list) < total_streams:
+            if global_stream_id == 0:
+                raise ValueError(
+                    f"[data warning] num_chunks={len(chunk_list)} < total_streams={total_streams}. "
+                    f"Some streams (ranks/workers) will have no data and stop immediately. "
+                    f"Consider: (1) produce more chunks, (2) reduce num_workers, "
+                    f"(3) reduce dp_world_size, or (4) increase dataset size."
+                )
+        
         my_chunks = chunk_list[global_stream_id :: total_streams]
 
         batches_skipped = 0
