@@ -23,7 +23,7 @@ def build_binary_chunks_and_save(args, dataset, tokenizer, eos_token_id,
             os.makedirs(output_dir, exist_ok=True)
         else:
             raise FileExistsError(
-                f"Output directory '{output_dir}' is not empty,"
+                f"Output directory '{output_dir}' is not empty, "
                 f"use --overwrite to clear it first."
             )
 
@@ -31,6 +31,10 @@ def build_binary_chunks_and_save(args, dataset, tokenizer, eos_token_id,
     # Ensure the maximum possible token ID fits in uint16 (<= 65535)
     dtype = np.uint16 if len(tokenizer) <= 65536 else np.uint32
     DTYPE_MAX = np.iinfo(dtype).max  # 65535 for uint16, 4294967295 for uint32
+    if eos_token_id > DTYPE_MAX:
+        raise ValueError(
+            f"eos_token_id={eos_token_id} exceeds dtype max {DTYPE_MAX}."
+        )
     print(f"Vocab size (incl. special tokens): {len(tokenizer)}. Using dtype: {dtype}")
 
     chunk_token_counts = []  # tokens count for each completed chunk
