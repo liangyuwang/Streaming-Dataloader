@@ -17,9 +17,15 @@ def build_binary_chunks_and_save(args, dataset, tokenizer, eos_token_id,
     os.makedirs(output_dir, exist_ok=True)
 
     existing = [p for p in os.listdir(output_dir) if not p.startswith(".")]
-    if existing and not getattr(args, "overwrite", False):
-        shutil.rmtree(output_dir)
-        os.makedirs(output_dir, exist_ok=True)
+    if existing:
+        if getattr(args, "overwrite", False):
+            shutil.rmtree(output_dir)
+            os.makedirs(output_dir, exist_ok=True)
+        else:
+            raise FileExistsError(
+                f"Output directory '{output_dir}' is not empty,"
+                f"use --overwrite to clear it first."
+            )
 
     # Optimization 1: Automatically choose dtype based on actual vocab size (including added tokens)
     # Ensure the maximum possible token ID fits in uint16 (<= 65535)
@@ -82,6 +88,25 @@ def build_binary_chunks_and_save(args, dataset, tokenizer, eos_token_id,
                 next_filepath = os.path.join(output_dir, f"chunk_{chunk_id:06d}.bin")
                 f = open(next_filepath, 'wb', buffering=1024 * 1024)
     
+    def _flush_encoded_batch(encoded_batch):
+        batch_max = max((max(s) for s in encoded_batch if s), default=-1)
+        if batch_max > DTYPE_MAX:
+            raise ValueError(
+                f"Token id overflow: batch max token id {batch_max} exceeds dtype max {DTYPE_MAX}. "
+                f"Current dtype={dtype}. Use uint32 (e.g., force dtype) or a tokenizer with smaller ids."
+            )
+        total = sum(len(seq) + 1 for seq in encoded_batch)  # +1 for eos
+        flat = np.empty(total, dtype=dtype)
+        pos = 0
+        for seq in encoded_batch:
+            L = len(seq)
+            if L:
+                flat[pos:pos+L] = seq
+                pos += L
+            flat[pos] = eos_token_id
+            pos += 1
+        write_tokens_to_bin(flat)
+
     text_buffer = []
     
     # Optimization 2: Accumulate a text batch, then send it to the tokenizer at once to leverage internal multithreading
@@ -98,39 +123,13 @@ def build_binary_chunks_and_save(args, dataset, tokenizer, eos_token_id,
         # Run batched processing when we have collected batch_size samples
         if len(text_buffer) >= batch_size:
             encoded_batch = tokenizer(text_buffer, add_special_tokens=False, return_attention_mask=False, return_token_type_ids=False)["input_ids"]
-            batch_max = -1
-            batch_max = -1
-            for seq in encoded_batch:
-                if seq:
-                    m = max(seq)
-                    if m > batch_max:
-                        batch_max = m
-            if batch_max > DTYPE_MAX:
-                raise ValueError(
-                    f"Token id overflow: batch max token id {batch_max} exceeds dtype max {DTYPE_MAX}. "
-                    f"Current dtype={dtype}. Use uint32 (e.g., force dtype) or a tokenizer with smaller ids."
-                )
-            # flatten batch into one big array: seq + eos for each sample
-            total = sum(len(seq) + 1 for seq in encoded_batch)  # +1 for eos
-            flat = np.empty(total, dtype=dtype)
-            pos = 0
-            for seq in encoded_batch:
-                L = len(seq)
-                if L:
-                    flat[pos:pos+L] = seq
-                    pos += L
-                flat[pos] = eos_token_id
-                pos += 1
-            write_tokens_to_bin(flat)
+            _flush_encoded_batch(encoded_batch)
             text_buffer = [] # Clear buffer
 
     # After the loop, process any remaining texts that do not make a full batch
     if text_buffer:
         encoded_batch = tokenizer(text_buffer, add_special_tokens=False, return_attention_mask=False, return_token_type_ids=False)["input_ids"]
-        for seq in encoded_batch:
-            if seq:
-                write_tokens_to_bin(seq)
-            write_tokens_to_bin([eos_token_id])
+        _flush_encoded_batch(encoded_batch)
 
     # Close the last file handle
     if not f.closed:
