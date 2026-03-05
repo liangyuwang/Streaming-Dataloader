@@ -1,148 +1,202 @@
 import os
-import gc
+import json
+import time
+import shutil
+import numpy as np
 import argparse
 from tqdm.auto import tqdm
-from datasets import load_dataset, Dataset
+from datasets import load_dataset
 from transformers import AutoTokenizer
 
-
-def build_token_chunks_and_save(dataset, tokenizer, eos_token_id,
-                                 output_dir, tokens_per_chunk=1000000,
-                                 max_samples=None):
+def build_binary_chunks_and_save(args, dataset, tokenizer, eos_token_id,
+                                 output_dir, tokens_per_chunk=100_000_000,
+                                 batch_size=1000, max_samples=None):
     """
-    Process a streaming dataset by tokenizing text and saving it in fixed-size chunks.
-    
-    This function is the core of the preprocessing pipeline. It:
-    1. Streams through the dataset to avoid loading everything into memory
-    2. Tokenizes text on-the-fly
-    3. Accumulates tokens in a buffer
-    4. Saves chunks when buffer reaches target size
-    5. Handles memory cleanup to prevent OOM
-    
-    Args:
-        dataset: HuggingFace streaming dataset
-        tokenizer: Pre-trained tokenizer for text encoding
-        eos_token_id (int): End-of-sequence token ID to add after each text
-        output_dir (str): Directory to save processed chunks
-        tokens_per_chunk (int): Target number of tokens per chunk
-        max_samples (int, optional): Maximum number of samples to process (for testing)
+    Stream-read data, tokenize in batches, and write results to raw binary (.bin) files.
     """
-    # Create output directory if it doesn't exist
     os.makedirs(output_dir, exist_ok=True)
 
-    buffer = []  # Accumulate tokens here before saving
-    chunk_id = 0  # Counter for naming chunk directories
+    existing = [p for p in os.listdir(output_dir) if not p.startswith(".")]
+    if existing and not getattr(args, "overwrite", False):
+        shutil.rmtree(output_dir)
+        os.makedirs(output_dir, exist_ok=True)
 
-    # Stream through dataset samples
-    for i, example in enumerate(tqdm(dataset, desc="Tokenizing")):
-        # Early termination for testing/debugging
+    # Optimization 1: Automatically choose dtype based on actual vocab size (including added tokens)
+    # Ensure the maximum possible token ID fits in uint16 (<= 65535)
+    dtype = np.uint16 if len(tokenizer) <= 65536 else np.uint32
+    DTYPE_MAX = np.iinfo(dtype).max  # 65535 for uint16, 4294967295 for uint32
+    print(f"Vocab size (incl. special tokens): {len(tokenizer)}. Using dtype: {dtype}")
+
+    chunk_token_counts = []  # tokens count for each completed chunk
+    chunk_id = 0
+    current_chunk_tokens = 0
+    
+    # Open the first binary file for writing
+    current_filepath = os.path.join(output_dir, f"chunk_{chunk_id:06d}.bin")
+    f = open(current_filepath, 'wb', buffering=1024 * 1024)
+
+    def write_tokens_to_bin(tokens):
+        """Write a 1-D sequence of token ids to file and auto-split by tokens_per_chunk."""
+        nonlocal chunk_id, current_chunk_tokens, f
+
+        # If tokens is numpy array, avoid extra conversion
+        if isinstance(tokens, np.ndarray):
+            arr = tokens.astype(dtype, copy=False)
+            idx = 0
+            n = arr.size
+            while idx < n:
+                space_left = tokens_per_chunk - current_chunk_tokens
+                end = min(idx + space_left, n)
+                f.write(arr[idx:end].tobytes())
+                written = end - idx
+                current_chunk_tokens += written
+                idx = end
+
+                if current_chunk_tokens >= tokens_per_chunk:
+                    f.close()
+                    chunk_token_counts.append(tokens_per_chunk)
+                    chunk_id += 1
+                    current_chunk_tokens = 0
+                    next_filepath = os.path.join(output_dir, f"chunk_{chunk_id:06d}.bin")
+                    f = open(next_filepath, 'wb', buffering=1024 * 1024)
+            return
+
+        # Otherwise treat as a Python sequence (list)
+        idx = 0
+        n = len(tokens)
+        while idx < n:
+            space_left = tokens_per_chunk - current_chunk_tokens
+            end = min(idx + space_left, n)
+
+            np_array = np.asarray(tokens[idx:end], dtype=dtype)
+            f.write(np_array.tobytes())
+            written = end - idx
+            current_chunk_tokens += written
+            idx = end
+
+            if current_chunk_tokens >= tokens_per_chunk:
+                f.close()
+                chunk_token_counts.append(tokens_per_chunk)
+                chunk_id += 1
+                current_chunk_tokens = 0
+                next_filepath = os.path.join(output_dir, f"chunk_{chunk_id:06d}.bin")
+                f = open(next_filepath, 'wb', buffering=1024 * 1024)
+    
+    text_buffer = []
+    
+    # Optimization 2: Accumulate a text batch, then send it to the tokenizer at once to leverage internal multithreading
+    for i, example in enumerate(tqdm(dataset, desc="Tokenizing to Binary")):
         if max_samples is not None and i >= max_samples:
             break
-
-        # Tokenize the text without special tokens (we'll add EOS manually)
-        tokens = tokenizer.encode(example["text"], add_special_tokens=False)
-        
-        # Add end-of-sequence token to mark document boundaries
-        # This is crucial for proper training as it signals where one document ends
-        tokens += [eos_token_id]
-        
-        # Add tokens to buffer
-        buffer.extend(tokens)
-
-        # Check if buffer has enough tokens to form a complete chunk
-        while len(buffer) >= tokens_per_chunk:
-            # Extract exactly tokens_per_chunk tokens for this chunk
-            chunk = buffer[:tokens_per_chunk]
-            # Keep remaining tokens for next chunk
-            buffer = buffer[tokens_per_chunk:]
-
-            # Create HuggingFace Dataset object with the chunk
-            # Each chunk contains a single sequence of token IDs
-            ds = Dataset.from_dict({"input_ids": [chunk]})
             
-            # Save chunk to disk with zero-padded naming for proper sorting
-            save_path = os.path.join(output_dir, f"chunk_{chunk_id:06d}")
-            ds.save_to_disk(save_path, max_shard_size=tokens_per_chunk*64)
-            chunk_id += 1
+        if args.text_field not in example:
+            raise KeyError(
+                f"Example missing field '{args.text_field}'. Available keys: {list(example.keys())}"
+            )
+        text_buffer.append(example[args.text_field])
+        
+        # Run batched processing when we have collected batch_size samples
+        if len(text_buffer) >= batch_size:
+            encoded_batch = tokenizer(text_buffer, add_special_tokens=False, return_attention_mask=False, return_token_type_ids=False)["input_ids"]
+            batch_max = -1
+            batch_max = -1
+            for seq in encoded_batch:
+                if seq:
+                    m = max(seq)
+                    if m > batch_max:
+                        batch_max = m
+            if batch_max > DTYPE_MAX:
+                raise ValueError(
+                    f"Token id overflow: batch max token id {batch_max} exceeds dtype max {DTYPE_MAX}. "
+                    f"Current dtype={dtype}. Use uint32 (e.g., force dtype) or a tokenizer with smaller ids."
+                )
+            # flatten batch into one big array: seq + eos for each sample
+            total = sum(len(seq) + 1 for seq in encoded_batch)  # +1 for eos
+            flat = np.empty(total, dtype=dtype)
+            pos = 0
+            for seq in encoded_batch:
+                L = len(seq)
+                if L:
+                    flat[pos:pos+L] = seq
+                    pos += L
+                flat[pos] = eos_token_id
+                pos += 1
+            write_tokens_to_bin(flat)
+            text_buffer = [] # Clear buffer
 
-            # Explicit memory cleanup to prevent accumulation
-            del ds
-            gc.collect()
+    # After the loop, process any remaining texts that do not make a full batch
+    if text_buffer:
+        encoded_batch = tokenizer(text_buffer, add_special_tokens=False, return_attention_mask=False, return_token_type_ids=False)["input_ids"]
+        for seq in encoded_batch:
+            if seq:
+                write_tokens_to_bin(seq)
+            write_tokens_to_bin([eos_token_id])
 
-    # Handle remaining tokens in buffer (last chunk may be smaller)
-    if buffer:
-        ds = Dataset.from_dict({"input_ids": [buffer]})
-        save_path = os.path.join(output_dir, f"chunk_{chunk_id:06d}")
-        ds.save_to_disk(save_path)
-        del ds
-        gc.collect()
+    # Close the last file handle
+    if not f.closed:
+        f.close()
+    
+    # Decide whether last chunk file is empty by checking file size (robust against state mismatches)
+    last_path = os.path.join(output_dir, f"chunk_{chunk_id:06d}.bin")
+    last_size = os.path.getsize(last_path) if os.path.exists(last_path) else 0
+    if last_size == 0:
+        # If the last file is truly empty (e.g., we exactly hit a chunk boundary), delete it
+        if os.path.exists(last_path):
+            os.remove(last_path)
+    else:
+        # Only record last chunk token count if file is non-empty
+        chunk_token_counts.append(current_chunk_tokens)
 
+    meta = {
+        "created_at_unix": int(time.time()),
+        "tokenizer_name_or_path": getattr(tokenizer, "name_or_path", None),
+        "is_fast": getattr(tokenizer, "is_fast", None),
+        "dtype": "uint16" if dtype == np.uint16 else "uint32",
+        "eos_token_id": int(eos_token_id),
+        "tokens_per_chunk": int(tokens_per_chunk),
+        "chunks": [
+            {"file": f"chunk_{i:06d}.bin", "tokens": int(n)}
+            for i, n in enumerate(chunk_token_counts)
+        ],
+        "total_tokens": int(sum(chunk_token_counts)),
+    }
+    with open(os.path.join(output_dir, "meta.json"), "w", encoding="utf-8") as mf:
+        json.dump(meta, mf, ensure_ascii=False, indent=2)
 
 def main(args):
-    """
-    Main preprocessing pipeline that orchestrates the entire process.
-    
-    This function:
-    1. Loads the streaming dataset from HuggingFace
-    2. Initializes the tokenizer
-    3. Handles special token configuration
-    4. Calls the chunking function
-    
-    Args:
-        args: Parsed command line arguments
-    """
-    # Load dataset in streaming mode to avoid memory issues
-    # Streaming=True means data is downloaded and processed on-demand
-    dataset = load_dataset("HuggingFaceFW/fineweb-edu", 
+    dataset = load_dataset(args.dataset, 
                           name=args.data_name, 
                           split="train", 
                           streaming=True)
-    
-    # Load pre-trained tokenizer
-    tokenizer = AutoTokenizer.from_pretrained(args.tokenizer)
-    
-    # Get end-of-sequence token ID
-    # Different tokenizers use different EOS tokens (e.g., GPT-2 uses <|endoftext|>)
-    eos_token_id = tokenizer.convert_tokens_to_ids(
-        tokenizer.eos_token or "<|endoftext|>"
-    )
+                          
+    tokenizer = AutoTokenizer.from_pretrained(args.tokenizer, use_fast=True)
+    eos_token_id = tokenizer.eos_token_id
+    if eos_token_id is None:
+        raise ValueError("Tokenizer has no eos_token_id; please set it or pass one explicitly.")
 
-    # Process and save the dataset
-    build_token_chunks_and_save(
+    build_binary_chunks_and_save(
+        args,
         dataset, 
         tokenizer, 
         eos_token_id,
         output_dir=args.output_path,
         tokens_per_chunk=int(args.tokens_per_chunk),
+        batch_size=args.batch_size, 
         max_samples=args.max_samples
     )
-
-    print(f"Token chunks saved to {args.output_path}")
+    print(f"Binary token chunks successfully saved to {args.output_path}")
 
 
 if __name__ == "__main__":
-    """
-    Command line interface for the preprocessing script.
-    
-    Example usage:
-    python fineweb_edu.py --tokenizer gpt2 --data_name sample-10BT --output_path ./data/processed/
-    """
-    parser = argparse.ArgumentParser(description="Preprocess FineWeb-Edu dataset for streaming training")
-    
-    parser.add_argument("--tokenizer", type=str, default="gpt2",
-                       help="Tokenizer model name or path (e.g., 'gpt2', 'microsoft/DialoGPT-medium')")
-    
-    parser.add_argument("--data_name", type=str, default="sample-10BT",
-                       help="FineWeb-Edu dataset variant (e.g., 'sample-10BT', 'sample-100BT')")
-    
-    parser.add_argument("--output_path", type=str, default="./data/fineweb-edu-sample-10BT/",
-                       help="Output directory for processed chunks")
-    
-    parser.add_argument("--tokens_per_chunk", type=int, default=1e8,
-                       help="Number of tokens per chunk (default: 100M)")
-    
-    parser.add_argument("--max_samples", type=int, default=None,
-                       help="Maximum number of samples to process (for testing)")
-    
+    parser = argparse.ArgumentParser(description="Preprocess FineWeb-Edu dataset into binary chunks")
+    parser.add_argument("--tokenizer", type=str, default="gpt2", help="Tokenizer model name or path (e.g., 'gpt2', 'meta-llama/Llama-2-7b-hf')")
+    parser.add_argument("--dataset", type=str, default="HuggingFaceFW/fineweb-edu", help="FineWeb-Edu dataset")
+    parser.add_argument("--data_name", type=str, default="sample-10BT", help="FineWeb-Edu dataset variant")
+    parser.add_argument("--text_field", type=str, default="text", help="Field name containing text in dataset examples (default: 'text').")
+    parser.add_argument("--output_path", type=str, default="./data/fineweb-edu-bin/", help="Output directory for processed binary chunks")
+    parser.add_argument("--tokens_per_chunk", type=int, default=100_000_000, help="Number of tokens per chunk (default: 100M)")
+    parser.add_argument("--batch_size", type=int, default=1000, help="Batch size for tokenizer (default: 1000)")
+    parser.add_argument("--max_samples", type=int, default=None, help="Maximum number of samples to process (for testing/debugging)")
+    parser.add_argument("--overwrite", action="store_true", help="If set, allow writing into a non-empty output directory (may overwrite chunks).")
     args = parser.parse_args()
     main(args)
