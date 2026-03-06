@@ -36,11 +36,12 @@ def get_training_info(args, dataset, dp_rank, dp_world_size, num_workers):
     if rem <= 0:
         return 0, 0
 
-    total_streams = dp_world_size * num_workers
+    effective_num_workers = max(num_workers, 1)
+    total_streams = dp_world_size * effective_num_workers
     local_samples = 0
 
-    for worker_id in range(num_workers):
-        global_stream_id = dp_rank * num_workers + worker_id
+    for worker_id in range(effective_num_workers):
+        global_stream_id = dp_rank * effective_num_workers + worker_id
         if global_stream_id >= rem:
             continue
         n = (rem - 1 - global_stream_id) // total_streams + 1
@@ -76,23 +77,15 @@ def main():
         dataloader.dataset.set_epoch(epoch)
         local_samples, local_num_batches = get_training_info(
             args, 
-            dataset, 
+            dataloader.dataset, 
             dp_rank=rank,
             dp_world_size=world_size,
             num_workers=args.num_workers,
         )
-        pbar = tqdm(
-            total=local_num_batches,
-            desc=f"Epoch {epoch}",
-            unit="batch",
-            disable=(rank != 0),
-        )
-        for batch in dataloader:
+        for batch in tqdm(dataloader, total=local_num_batches, desc=f"Epoch {epoch}", disable=(rank != 0)):
             input_ids, labels = batch["input_ids"], batch["labels"]
             # input_ids = input_ids.cuda(local_rank, non_blocking=True)
             # labels = labels.cuda(local_rank, non_blocking=True)
-            pbar.update(1)
-        pbar.close()
 
     cleanup_distributed()
 
