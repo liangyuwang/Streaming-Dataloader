@@ -81,10 +81,18 @@ def main():
             dp_world_size=world_size,
             num_workers=args.num_workers,
         )
-        for batch in tqdm(dataloader, total=local_num_batches, desc=f"Epoch {epoch}", disable=(rank != 0)):
+        pbar = tqdm(
+            total=local_num_batches,
+            desc=f"Epoch {epoch}",
+            unit="batch",
+            disable=(rank != 0),
+        )
+        for batch in dataloader:
             input_ids, labels = batch["input_ids"], batch["labels"]
             # input_ids = input_ids.cuda(local_rank, non_blocking=True)
             # labels = labels.cuda(local_rank, non_blocking=True)
+            pbar.update(1)
+        pbar.close()
 
     cleanup_distributed()
 
