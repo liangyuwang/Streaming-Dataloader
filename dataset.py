@@ -155,7 +155,7 @@ class DistributedDataset(IterableDataset):
 
         if local_offset + length <= chunk_len:
             arr = self._memmaps[chunk_idx][local_offset : local_offset + length]
-            return np.asarray(arr)  # materialize contiguous array view/copy as needed
+            return np.array(arr)  # materialize contiguous array view/copy as needed
 
         # Slow path: crosses chunk boundary
         out = np.empty(length, dtype=self.dtype)
@@ -232,10 +232,3 @@ class DistributedDataset(IterableDataset):
             x = t[:-1]
             y = t[1:]
             yield x, y
-
-
-def lm_collate(batch):
-    xs, ys = zip(*batch)  # each is [seq_len]
-    x = torch.stack(xs, dim=0).long()
-    y = torch.stack(ys, dim=0).long()
-    return x, y
