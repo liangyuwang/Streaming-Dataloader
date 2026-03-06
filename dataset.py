@@ -185,6 +185,9 @@ class DistributedDataset(IterableDataset):
 
         return out
 
+    def __len__(self):
+        return self.total_samples
+
     def __iter__(self):
         worker_info = torch.utils.data.get_worker_info()
         worker_id = worker_info.id if worker_info is not None else 0
