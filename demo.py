@@ -1,4 +1,5 @@
 import os
+import math
 import argparse
 import torch
 import torch.distributed as dist
@@ -30,6 +31,26 @@ def cleanup_distributed():
         dist.destroy_process_group()
 
 
+def get_training_info(args, dataset, dp_rank, dp_world_size, num_workers):
+    rem = dataset.total_samples - dataset.global_skip_batches
+    if rem <= 0:
+        return 0, 0
+
+    total_streams = dp_world_size * num_workers
+    local_samples = 0
+
+    for worker_id in range(num_workers):
+        global_stream_id = dp_rank * num_workers + worker_id
+        if global_stream_id >= rem:
+            continue
+        n = (rem - 1 - global_stream_id) // total_streams + 1
+        local_samples += n
+
+    local_num_batches = math.ceil(local_samples / args.batch_size)
+
+    return local_samples, local_num_batches
+
+
 def main():
     args = get_args()
     rank, local_rank, world_size = setup_distributed()
@@ -39,8 +60,8 @@ def main():
         seq_len=args.seq_len,
         shuffle=True,
         seed=123,
-        dp_rank = rank,
-        dp_world_size = world_size,
+        dp_rank=rank,
+        dp_world_size=world_size,
     )
     dataloader = DataLoader(
         dataset,
@@ -53,7 +74,14 @@ def main():
 
     for epoch in range(10):
         dataloader.dataset.set_epoch(epoch)
-        for batch in tqdm(dataloader, desc=f"Epoch {epoch}", disable=(rank != 0)):
+        local_samples, local_num_batches = get_training_info(
+            args, 
+            dataset, 
+            dp_rank=rank,
+            dp_world_size=world_size,
+            num_workers=args.num_workers,
+        )
+        for batch in tqdm(dataloader, total=local_num_batches, desc=f"Epoch {epoch}", disable=(rank != 0)):
             input_ids, labels = batch["input_ids"], batch["labels"]
             # input_ids = input_ids.cuda(local_rank, non_blocking=True)
             # labels = labels.cuda(local_rank, non_blocking=True)
