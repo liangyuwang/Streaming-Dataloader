@@ -18,11 +18,11 @@ def get_args():
 
 
 def setup_distributed():
-    dist.init_process_group(backend="nccl")
+    dist.init_process_group(backend="gloo") # set to "nccl" if you have GPU
     rank = dist.get_rank()
     world_size = dist.get_world_size()
     local_rank = int(os.environ["LOCAL_RANK"])
-    torch.cuda.set_device(local_rank)
+    # torch.cuda.set_device(local_rank)
     return rank, local_rank, world_size
 
 
