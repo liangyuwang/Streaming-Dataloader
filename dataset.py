@@ -36,6 +36,8 @@ class DistributedDataset(IterableDataset):
         seed=42,
         global_skip_batches=0,      # number of globally-consumed samples to skip
         strict=True,                # if True, require enough samples for all streams
+        dp_rank=None,
+        dp_world_size=None,
     ):
         super().__init__()
         self.data_dir = data_dir
@@ -46,6 +48,11 @@ class DistributedDataset(IterableDataset):
         self.epoch = 0
         self.global_skip_batches = int(global_skip_batches or 0)
         self.strict = bool(strict)
+        self.dp_rank = dp_rank
+        self.dp_world_size = dp_world_size
+        
+        if (self.dp_rank is None) != (self.dp_world_size is None):
+            raise ValueError("dp_rank and dp_world_size must be both set or both None.")
 
         # ---- load meta.json if available ----
         meta_path = os.path.join(data_dir, "meta.json")
@@ -183,7 +190,10 @@ class DistributedDataset(IterableDataset):
         worker_id = worker_info.id if worker_info is not None else 0
         num_workers = worker_info.num_workers if worker_info is not None else 1
 
-        if dist.is_available() and dist.is_initialized():
+        if self.dp_rank is not None and self.dp_world_size is not None:
+            dp_rank = self.dp_rank
+            dp_world_size = self.dp_world_size
+        elif dist.is_available() and dist.is_initialized():
             dp_rank = dist.get_rank()
             dp_world_size = dist.get_world_size()
         else:
@@ -231,4 +241,4 @@ class DistributedDataset(IterableDataset):
 
             x = t[:-1]
             y = t[1:]
-            yield x, y
+            yield {"input_ids": x, "labels": y}
