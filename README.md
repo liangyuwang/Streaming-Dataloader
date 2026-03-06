@@ -135,6 +135,25 @@ for batch in loader:
     labels = batch["labels"]         # [batch, seq_len]
 ```
 
+## How To Integrate Into Your Trainer
+
+The integration surface is intentionally small: `DistributedDataset` already returns the two tensors most causal LM trainers expect:
+
+- `batch["input_ids"]`
+- `batch["labels"]`
+
+So in most training codebases, including a trainer-organized repo such as [Tinytron](https://github.com/liangyuwang/Tinytron), you only need to replace the dataset initialization part and keep the model/loss loop unchanged.
+
+If your trainer has a dedicated dataset hook, the practical pattern is:
+
+- initialize `DistributedDataset` in your dataset-building step
+- wrap it with a normal `DataLoader`
+- call `set_epoch(epoch)` once per epoch before iterating
+- pass `dp_rank` and `dp_world_size` explicitly if your trainer already manages distributed state
+- use `global_skip_batches` if your checkpoint format stores how many global samples were already consumed
+
+For a codebase shaped like [Tinytron](https://github.com/liangyuwang/Tinytron), this usually means swapping the implementation inside the trainer's dataset initialization path, while leaving optimizer, scheduler, checkpoint, and model code untouched.
+
 ### Dataset Behavior
 
 `DistributedDataset` is an `IterableDataset` with the following behavior:
