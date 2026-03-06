@@ -1,303 +1,237 @@
 # Streaming-Dataloader
 
-A memory-efficient streaming data loader designed for LLM pretraining under limited CPU and GPU memory constraints.
+`Streaming-Dataloader` is a small prototype for LLM next-token training on large tokenized corpora.
 
-## 🎯 Overview
+It has two parts:
 
-Streaming-Dataloader is a high-performance data loading solution that enables training large language models on massive datasets without overwhelming system memory. It uses smart caching, sliding window techniques, and distributed processing to handle terabyte-scale datasets efficiently.
+- a preprocessing script that streams text from Hugging Face, tokenizes it, and writes raw token shards to disk
+- an `IterableDataset` that treats those shards as one logical token stream and splits samples across distributed ranks and `DataLoader` workers
 
-## ✨ Key Features
+This README reflects the current code in `prepare/fineweb_edu.py`, `dataset.py`, and `demo.py`.
 
-- **Memory Efficient**: LRU cache mechanism controls memory usage, preventing OOM errors
-- **Streaming Processing**: Processes data chunks on-demand without loading entire datasets
-- **Sliding Window**: Maximizes data utilization through configurable stride patterns  
-- **Dynamic Shifts**: Increases training data diversity with randomized sequence shifts
-- **Distributed Ready**: Built-in support for multi-GPU and multi-node training
-- **Thread Safe**: Robust concurrent data loading with multiple workers
+## What The Repo Does
 
-## 🚀 Performance Highlights
+The project stores tokenized data as:
 
-- **Low Memory Footprint**: Works efficiently with <32GB CPU RAM and <24GB GPU memory
-- **Scalable**: Handles TB-scale datasets through intelligent chunking
-- **Fast Loading**: Binary search optimization for rapid chunk location
-- **High Throughput**: Optimized batch processing with shared shift values
+- `chunk_000000.bin`, `chunk_000001.bin`, ...
+- `meta.json`
 
-## 📦 Installation
+Each `.bin` file contains contiguous token ids in `uint16` or `uint32`. At runtime, `DistributedDataset` opens them with `numpy.memmap`, so the whole corpus does not need to be loaded into RAM.
 
-```bash
-git clone https://github.com/your-username/Streaming-Dataloader.git
-cd Streaming-Dataloader
+Each training sample is defined as a contiguous block of `seq_len + 1` tokens:
+
+```text
+sample_id -> tokens[start : start + seq_len + 1]
+input_ids = tokens[:-1]
+labels    = tokens[1:]
 ```
 
-### Dependencies
+This is standard autoregressive next-token training.
 
-This project requires the following packages with tested versions:
+## Repository Layout
 
-- **PyTorch**: 2.4.0
-- **CUDA**: 12.1
-- **datasets**: 3.5.1
-- **transformers**: 4.51.3
-- **tqdm**: 4.66.5
-- **numpy**: 1.26.4
+- `prepare/fineweb_edu.py`: stream a dataset, tokenize it, and write binary shards plus `meta.json`
+- `dataset.py`: `DistributedDataset`, the core iterable dataset used at training time
+- `demo.py`: a minimal distributed demo that builds the dataset and iterates over batches
 
-Please install these dependencies according to your environment setup.
+## Install
 
-## 🔧 Data Preparation
-
-First, prepare your dataset by tokenizing and chunking:
+There is no packaged installation yet, so install the runtime dependencies directly in your Python environment.
 
 ```bash
-cd prepare/
-
-# Optional: For users who cannot use HF, use HF-mirror
-export HF_ENDPOINT="https://hf-mirror.com"
-
-# Prepare FineWeb-Edu dataset (example)
-python fineweb_edu.py \
-    --tokenizer gpt2 \
-    --data_name sample-10BT \
-    --output_path ./data/fineweb-edu-sample-10BT/ \
-    --tokens_per_chunk 100000000 \
-    --max_samples 1000
+pip install torch numpy datasets transformers tqdm
 ```
 
-**Parameters:**
-- `--tokenizer`: Tokenizer model (default: gpt2)
-- `--data_name`: Dataset name from HuggingFace
-- `--output_path`: Output directory for processed chunks
-- `--tokens_per_chunk`: Tokens per chunk (default: 100M)
-- `--max_samples`: Maximum samples to process (optional)
+If you plan to use Hugging Face streaming datasets behind a mirror, set `HF_ENDPOINT` before preprocessing.
 
-## 💻 Usage
+## Data Format
 
-### Single GPU Training
+After preprocessing, the output directory looks like this:
+
+```text
+data/your-dataset/
+├── chunk_000000.bin
+├── chunk_000001.bin
+├── ...
+└── meta.json
+```
+
+`meta.json` records:
+
+- tokenizer name
+- whether the tokenizer is fast
+- storage dtype
+- `eos_token_id`
+- configured `tokens_per_chunk`
+- per-chunk token counts
+- total token count
+
+The dataset code prefers the chunk order recorded in `meta.json`. If `meta.json` is missing, it falls back to sorted `*.bin` files and infers lengths from file sizes.
+
+## Preprocess Data
+
+The included preprocessing script targets FineWeb-Edu, but the output format is generic enough for the runtime dataset.
+
+Example:
+
+```bash
+python prepare/fineweb_edu.py \
+  --tokenizer gpt2 \
+  --dataset HuggingFaceFW/fineweb-edu \
+  --data_name sample-10BT \
+  --text_field text \
+  --output_path ./data/fineweb-edu-sample-10BT \
+  --tokens_per_chunk 100000000 \
+  --batch_size 1000
+```
+
+Useful flags:
+
+- `--tokenizer`: tokenizer name or local path
+- `--dataset`: Hugging Face dataset id
+- `--data_name`: dataset config name
+- `--text_field`: field containing raw text
+- `--output_path`: directory to write `.bin` shards and `meta.json`
+- `--tokens_per_chunk`: max number of tokens per shard
+- `--batch_size`: text batch size sent to the tokenizer
+- `--max_samples`: optional limit for debugging
+- `--overwrite`: clear a non-empty output directory before writing
+
+Implementation details:
+
+- the script reads the dataset with `streaming=True`
+- each example is tokenized without adding model-specific special tokens
+- one `eos_token_id` is appended after every sample
+- dtype is chosen automatically:
+  - `uint16` when the tokenizer vocab fits in 65536 ids
+  - otherwise `uint32`
+
+## Use `DistributedDataset`
+
+Minimal single-process example:
 
 ```python
-from dataset import SlidingTokenDataset
 from torch.utils.data import DataLoader
+from dataset import DistributedDataset
 
-# Create dataset
-dataset = SlidingTokenDataset(
-    dataset_path="./data/fineweb-edu-sample-10BT",
-    split="train",
-    split_rate=0.9,
+dataset = DistributedDataset(
+    data_dir="./data/fineweb-edu-sample-10BT",
     seq_len=1024,
-    stride=512,
-    batch_size=16,
-    cache_capacity=2
+    shuffle=True,
+    seed=123,
 )
 
-# Create dataloader
-dataloader = DataLoader(
-    dataset, 
-    batch_size=16, 
-    num_workers=4, 
-    pin_memory=True
+loader = DataLoader(
+    dataset,
+    batch_size=8,
+    shuffle=False,
+    num_workers=0,
+    pin_memory=True,
 )
 
-# Training loop
-for epoch in range(10):
-    dataset.set_epoch(epoch)  # Important: set epoch for randomization
-    for batch in dataloader:
-        input_ids = batch["input_ids"]  # [batch_size, seq_len//shift, shift]
-        labels = batch["labels"]        # [batch_size, seq_len//shift, shift]
-        shift = batch["shift"]          # shift value used for this batch
-        
-        # Your training code here
-        loss = model(input_ids, labels=labels)
-        loss.backward()
+dataset.set_epoch(0)
+for batch in loader:
+    input_ids = batch["input_ids"]   # [batch, seq_len]
+    labels = batch["labels"]         # [batch, seq_len]
 ```
 
-### Multi-GPU Training
+### Dataset Behavior
+
+`DistributedDataset` is an `IterableDataset` with the following behavior:
+
+- all shards are treated as one logical global token stream
+- only the final global tail is dropped
+- samples can cross shard boundaries
+- shard files are memory-mapped lazily with `numpy.memmap`
+- work is split across:
+  - distributed ranks
+  - `DataLoader` workers inside each rank
+- optional deterministic shuffle is controlled by `seed` and `set_epoch(epoch)`
+- `global_skip_batches` can be used to skip already-consumed global samples during resume
+
+### How Samples Are Assigned
+
+Let:
+
+- `block_size = seq_len + 1`
+- `total_streams = dp_world_size * num_workers`
+- `global_stream_id = dp_rank * num_workers + worker_id`
+
+Then each stream reads:
+
+```text
+sample_ids = global_stream_id, global_stream_id + total_streams, ...
+```
+
+When shuffling is enabled, the dataset first builds a global permutation for the epoch, then takes every `total_streams`-th sample for each stream.
+
+## Run The Demo
+
+`demo.py` is a smoke test for distributed loading. It does not include a model, optimizer, loss computation, or checkpointing.
+
+Single-process run:
 
 ```bash
-# Run with torchrun
-torchrun --nproc_per_node=4 demo.py \
-    --data_path ./data/fineweb-edu-sample-10BT \
-    --seq_len 2048 \
-    --stride 1024 \
-    --batch_size 8 \
-    --num_workers 2
+python demo.py \
+  --data_path ./data/fineweb-edu-sample-10BT \
+  --seq_len 1024 \
+  --batch_size 16 \
+  --num_workers 0
 ```
 
-### Quick Demo
+Distributed run:
 
 ```bash
-# Single GPU
-python demo.py --data_path ./data/fineweb-edu-sample-10BT
-
-# Multi-GPU (DDP)
-torchrun --nproc_per_node=2 demo.py --data_path ./data/fineweb-edu-sample-10BT
+torchrun --nproc_per_node=2 demo.py \
+  --data_path ./data/fineweb-edu-sample-10BT \
+  --seq_len 1024 \
+  --batch_size 16 \
+  --num_workers 0
 ```
 
-## ⚙️ Configuration
+Notes:
 
-### SlidingTokenDataset Parameters
+- `demo.py` currently initializes `torch.distributed` with `gloo`
+- CUDA placement lines are present but commented out
+- for GPU training, you will likely want to switch the backend to `nccl` and move tensors to the correct device in your own training script
 
-| Parameter | Type | Default | Description |
-|-----------|------|---------|-------------|
-| `dataset_path` | str | None | Path to processed dataset chunks |
-| `split` | str | "train" | Dataset split ("train" or "validation") |
-| `split_rate` | float | 1.0 | Train/validation split ratio |
-| `seq_len` | int | 1024 | Sequence length |
-| `stride` | int | 512 | Sliding window stride |
-| `batch_size` | int | 1 | Batch size for shift grouping |
-| `m` | int | 1 | Fixed shift value (default 1 for next token prediction) |
-| `seed` | int | 42 | Random seed |
-| `rank` | int | 0 | Process rank for distributed training |
-| `world_size` | int | 1 | Total number of processes |
-| `cache_capacity` | int | 2 | LRU cache capacity (number of chunks) |
-| `tokens_per_chunk` | float | 1e8 | Expected tokens per chunk |
+## Main `DistributedDataset` Arguments
 
-## 🧠 How It Works
+| Argument | Default | Meaning |
+| --- | --- | --- |
+| `data_dir` | required | Directory containing shards and optional `meta.json` |
+| `seq_len` | `2048` | Sequence length of `input_ids` and `labels` |
+| `dtype` | `None` | Force storage dtype, otherwise infer from `meta.json` |
+| `shuffle` | `False` | Whether to reshuffle sample order per epoch |
+| `seed` | `42` | Base seed for deterministic shuffling |
+| `global_skip_batches` | `0` | Number of global samples to skip before iteration |
+| `strict` | `True` | Raise if there are fewer samples than total streams |
+| `dp_rank` | `None` | Explicit distributed rank override |
+| `dp_world_size` | `None` | Explicit distributed world size override |
 
-### 1. Data Chunking
-```
-Original Dataset → Tokenize → Split into Chunks → Save to Disk
-[Raw Text] → [Tokens] → [Chunk_0, Chunk_1, ...] → [chunk_000000/, chunk_000001/, ...]
-```
+If `dp_rank` and `dp_world_size` are not passed, the dataset will try to read them from `torch.distributed` when available.
 
-### 2. Sliding Window Processing
-```
-Sequence: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11]
-stride=4, seq_len=8, shift=2
+## Design Choices
 
-Sample 1: input=[0,1,2,3,4,5,6,7], label=[2,3,4,5,6,7,8,9]
-Sample 2: input=[4,5,6,7,8,9,10,11], label=[6,7,8,9,10,11,12,13]
-```
+This repo deliberately uses a simple data format and loader design:
 
-### 3. Memory Management
-- **LRU Cache**: Only keeps recently accessed chunks in memory
-- **Lazy Loading**: Loads chunks only when needed
-- **Garbage Collection**: Automatic cleanup of unused chunks
+- no external index file
+- no per-chunk tail dropping
+- no in-memory corpus loading
+- no custom C++ extension
 
-## 🔍 Architecture
+The tradeoff is that this is a focused prototype for autoregressive language modeling, not a general-purpose dataset library.
 
-```
-┌─────────────────┐    ┌─────────────────┐    ┌─────────────────┐
-│   Data Prep     │    │  Sliding Window │    │   LRU Cache     │
-│   (streaming)   │───▶│   Processing    │───▶│   Management    │
-│                 │    │                 │    │                 │
-└─────────────────┘    └─────────────────┘    └─────────────────┘
-         │                       │                       │
-         ▼                       ▼                       ▼
-┌─────────────────┐    ┌─────────────────┐    ┌─────────────────┐
-│ Tokenized Chunks│    │ Batched Samples │    │ Memory Efficient│
-│ chunk_000000/   │    │ with Shifts     │    │ Loading         │
-│ chunk_000001/   │    │                 │    │                 │
-└─────────────────┘    └─────────────────┘    └─────────────────┘
-```
+## Limitations
 
-## 📊 Memory Usage
+Current limitations from the codebase:
 
-| Component | Memory Impact | Notes |
-|-----------|---------------|-------|
-| Chunk Cache | `cache_capacity × chunk_size` | Typically 2 × 100M tokens |
-| Batch Buffer | `batch_size × seq_len × dtype` | Temporary batch storage |
-| Metadata | Minimal | Only stores chunk lengths and indices |
+- preprocessing is currently specialized around FineWeb-Edu-style text streaming
+- the runtime dataset only supports fixed-length next-token samples
+- there is no validation or test suite in the repo
+- there is no packaged environment file such as `requirements.txt` or `pyproject.toml`
+- `demo.py` demonstrates loading only; it is not a full trainer
 
-**Example**: With `cache_capacity=2`, `tokens_per_chunk=1e8`, each chunk ~400MB, total cache ~800MB.
+## License
 
-## 🎛️ Advanced Usage
-
-### Custom Shift Strategy
-```python
-# Use fixed shift for consistent batching
-dataset = SlidingTokenDataset(
-    dataset_path="./data/your-dataset",
-    seq_len=1024,
-    m=256,  # Fixed shift value
-)
-
-# Let the system choose optimal shifts automatically
-dataset = SlidingTokenDataset(
-    dataset_path="./data/your-dataset", 
-    seq_len=1024,
-    # m=None (default) - uses proper divisors of seq_len
-)
-```
-
-### Memory Optimization
-```python
-# For memory-constrained environments
-dataset = SlidingTokenDataset(
-    dataset_path="./data/your-dataset",
-    cache_capacity=1,      # Minimal cache
-    tokens_per_chunk=5e7,  # Smaller chunks
-)
-
-# For high-memory environments  
-dataset = SlidingTokenDataset(
-    dataset_path="./data/your-dataset",
-    cache_capacity=10,     # Larger cache
-    tokens_per_chunk=2e8,  # Bigger chunks
-)
-```
-
-## 🐛 Troubleshooting
-
-### Common Issues
-
-**Out of Memory (OOM)**
-```python
-# Reduce cache capacity
-cache_capacity=1
-
-# Reduce batch size
-batch_size=8
-
-# Use smaller chunks in preprocessing
-tokens_per_chunk=5e7
-```
-
-**Slow Loading**
-```python
-# Increase cache capacity (if memory allows)
-cache_capacity=5
-
-# Increase number of workers
-num_workers=4
-
-# Use larger chunks
-tokens_per_chunk=2e8
-```
-
-**Data Imbalance in DDP**
-```python
-# Ensure proper distributed setup
-dataset = SlidingTokenDataset(
-    dataset_path="./data/your-dataset",
-    rank=rank,          # Must set rank
-    world_size=world_size  # Must set world_size  
-)
-```
-
-## 📈 Performance Tips
-
-1. **Optimize Cache Size**: Balance between memory usage and I/O operations
-2. **Tune Chunk Size**: Larger chunks = fewer files but more memory per chunk
-3. **Use SSD Storage**: Significantly improves chunk loading speed
-4. **Pin Memory**: Use `pin_memory=True` in DataLoader for GPU training
-5. **Proper Workers**: Set `num_workers` based on CPU cores and I/O capacity
-
-## 🤝 Contributing
-
-Contributions are welcome! Please feel free to:
-- Report bugs and issues
-- Suggest new features  
-- Submit pull requests
-- Improve documentation
-
-## 📄 License
-
-This project is licensed under the MIT License - see the [LICENSE](LICENSE) file for details.
-
-## 🙏 Acknowledgments
-
-- HuggingFace for the datasets library
-- PyTorch team for distributed training utilities
-- FineWeb-Edu dataset for providing high-quality training data
-
----
-
-**Built for efficient LLM pretraining** 🚀
+See `LICENSE` if you add one. The current repository contents do not define license terms inside the code itself.
