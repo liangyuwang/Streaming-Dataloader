@@ -198,7 +198,7 @@ if __name__ == "__main__":
     parser.add_argument("--dataset", type=str, default="HuggingFaceFW/fineweb-edu", help="FineWeb-Edu dataset")
     parser.add_argument("--data_name", type=str, default="sample-10BT", help="FineWeb-Edu dataset variant")
     parser.add_argument("--text_field", type=str, default="text", help="Field name containing text in dataset examples (default: 'text').")
-    parser.add_argument("--output_path", type=str, default="./data/fineweb-edu-bin/", help="Output directory for processed binary chunks")
+    parser.add_argument("--output_path", type=str, default="./data/fineweb-edu-sample-10BT/", help="Output directory for processed binary chunks")
     parser.add_argument("--tokens_per_chunk", type=int, default=100_000_000, help="Number of tokens per chunk (default: 100M)")
     parser.add_argument("--batch_size", type=int, default=1000, help="Batch size for tokenizer (default: 1000)")
     parser.add_argument("--max_samples", type=int, default=None, help="Maximum number of samples to process (for testing/debugging)")
